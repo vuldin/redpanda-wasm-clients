@@ -1,0 +1,21 @@
+[package]
+name = "wasm-matcher-rs"
+version = "0.1.0"
+edition = "2021"
+
+# Not a port of the Go implementation's source, a faithful reimplementation
+# of the same logic in Rust - see ../README.md's "Why a Rust variant"
+# section for what this exists to measure and why it's not the primary
+# reference client.
+[[bin]]
+name = "wasm-matcher-rs"
+path = "src/main.rs"
+
+[dependencies]
+redpanda-transform-sdk = { git = "https://github.com/redpanda-data/redpanda", branch = "dev" }
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
