@@ -211,6 +211,39 @@ func main() {
 		// don't compare a faster-but-weaker guarantee.
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.ProducerLinger(time.Duration(lingerMs)*time.Millisecond),
+
+		// Recover fast when a partition changes leader.
+		//
+		// franz-go's defaults are tuned for throughput, not for the tail during
+		// a leadership move, and they cost seconds. Measured on a 3-broker
+		// cluster during a maintenance drain (2026-09-09): produce p99 4.72s
+		// with a max of 5.0097s, while the BROKER's own produce handling stayed
+		// flat at 0.18ms and its worst sampled window was 0.565ms. The time was
+		// not spent in Redpanda at all - the record sat here, waiting to be
+		// told where the new leader was.
+		//
+		// MetadataMinAge is the cause. It rate-limits how soon the client will
+		// re-fetch metadata after a NOT_LEADER, and it defaults to 5s - which
+		// is the 5.0097s max, near-exactly. The floor franz-go allows is 10ms;
+		// 100ms recovers within a fraction of a leadership transfer while still
+		// bounding how hard a large fleet can hammer the cluster for metadata.
+		kgo.MetadataMinAge(100 * time.Millisecond),
+
+		// The retry backoff compounds it: the default escalates from 250ms to a
+		// 5s cap, so a couple of failed attempts during a transfer add seconds
+		// of their own on top of the metadata wait. This keeps retries inside
+		// the window a leadership transfer actually takes.
+		kgo.RetryBackoffFn(func(fails int) time.Duration {
+			const (
+				base = 50 * time.Millisecond
+				max  = 500 * time.Millisecond
+			)
+			d := base << min(fails, 4)
+			if d > max {
+				return max
+			}
+			return d
+		}),
 	)
 	if err != nil {
 		log.Fatalf("wasm-client: creating kafka client: %v", err)
