@@ -227,7 +227,7 @@ func main() {
 		// is the 5.0097s max, near-exactly. The floor franz-go allows is 10ms;
 		// 100ms recovers within a fraction of a leadership transfer while still
 		// bounding how hard a large fleet can hammer the cluster for metadata.
-		kgo.MetadataMinAge(100 * time.Millisecond),
+		kgo.MetadataMinAge(100*time.Millisecond),
 
 		// The retry backoff compounds it: the default escalates from 250ms to a
 		// 5s cap, so a couple of failed attempts during a transfer add seconds
@@ -277,6 +277,16 @@ func main() {
 	}
 	if err := h.defineHostFuncs(linker, store); err != nil {
 		log.Fatalf("wasm-client: defining host funcs: %v", err)
+	}
+	// book-matcher imports the broker's shared-memory host module for its
+	// optional snapshot state. Outside the broker there is nothing to persist
+	// into, so register_region is accepted and ignored - which is exactly what
+	// the guest does with STATE=off (it never calls it). Defining it is what
+	// lets the SAME module run in the external arm as in the in-broker one;
+	// guests that do not import it are unaffected.
+	if err := linker.FuncWrap("redpanda_wasm_shared_memory", "register_region",
+		func(ptr, length int32) int32 { return 0 }); err != nil {
+		log.Fatalf("wasm-client: defining shared-memory stub: %v", err)
 	}
 
 	instance, err := linker.Instantiate(store, module)
