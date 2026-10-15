@@ -46,8 +46,15 @@ make test       # cargo test, wire format and matching logic
 | `passthrough.wasm` | zero-work control. Same plumbing, no matching, so it isolates relay cost from guest cost |
 | `relay-sink.wasm` | terminal consumer for fan-out load, where only the delivery matters and the output doesn't |
 | `position-tracker.wasm` | consumes fills and maintains per-participant position. An example of a stateful relay-sourced consumer |
+| `mass-matcher.wasm` | the matcher plus wire type 2 mass-quote envelopes (N orders per record). A separate module so `wasm-matcher.wasm` stays byte-identical to the published one |
+| `book-matcher.wasm` | a matcher whose book holds depth (`rust/src/fastbook.rs`: price levels in a BTreeMap, FIFO queues in a slab, an id index) and, with `STATE=snapshot`, persists itself through the broker's shared-memory state API. Must be trusted by sha256 to load; see the bench repo's `docs/RUNNING-YOUR-OWN-TESTS.md` |
 
-All five share `rust/src/wire.rs`, `matcher.rs`, `orderbook.rs` and `risk.rs`.
+The guests share `rust/src/wire.rs`, and the matchers share `matcher.rs`,
+`orderbook.rs` and `risk.rs` by path. `book-matcher` is differentially tested
+against `orderbook.rs` (200k random operations, identical fills and book).
+The published modules are checked in under `rust/testdata/published-modules/`;
+`make build-wasm` restores and verifies them, so a rebuild never silently
+replaces a module a published figure was measured on.
 
 ## The host
 
