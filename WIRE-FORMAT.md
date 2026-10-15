@@ -45,6 +45,42 @@ contract. Change it here first, then both implementations.
 | type | `u8` | `1` |
 | order_id | `str` | |
 
+### MassQuote, input to the matcher
+
+One record carrying several orders, the way an exchange's mass-quote message
+does. It exists so orders/sec and records/sec can be driven independently: the
+per-record cost of the transform output-write path is what sets the rate
+ceiling, so N orders in one record amortise that cost over N orders instead of
+paying it once per order. It is also what makes our orders/sec comparable to a
+customer's, since they count orders and we counted records.
+
+| field | type | notes |
+|---|---|---|
+| type | `u8` | `2` |
+| count | `u16` | number of orders; `0` is legal |
+| orders | `count` x order body | the NewOrder layout above, **without** its type byte |
+
+Three rules, each of which has a test on both sides:
+
+- **A count larger than the bytes supplied is an error, not a short envelope.**
+  A truncated record must never be processed as if it were complete.
+- **Trailing bytes after the last order are filler and must be ignored**, same
+  as every other message here.
+- **A `count=1` envelope's body is byte-identical to what NewOrder encodes,
+  minus the type byte.** This is what keeps single-order and mass figures
+  comparable, so both repositories assert it directly.
+
+The separate type byte is deliberate rather than extending NewOrder with "if
+bytes remain, parse another order". Padding is legal filler everywhere else in
+this format, so that extension would make a padded single-order record from a
+published run decode as an envelope full of garbage orders. With a distinct
+type byte every existing decoder fails loudly instead.
+
+Note what batching necessarily costs: one record has one send instant, earns
+one `matched_at_nanos` and one receipt. Per-order ids inside an envelope buy
+per-order *delivery accounting*, never per-order latency. Any "per-order
+latency" under mass quotes is an envelope latency quoted N times.
+
 ### Fills, output of the matcher
 
 No leading type byte. A fills payload is a count followed by that many fill
@@ -94,7 +130,28 @@ Two things that are easy to get wrong:
 
 ## Conformance
 
-The harness repository carries a decoder test against a fixture produced by
-the Rust guest here. If you change anything above, regenerate that fixture. A
-format change that passes both test suites separately can still break the
-pair.
+The harness repository carries decoder tests against fixtures produced by the
+Rust guest here. If you change anything above, regenerate them. A format change
+that passes both test suites separately can still break the pair.
+
+Two fixtures, covering both directions:
+
+- `wire/testdata/fills-from-rust-guest.hex` (output direction) - produced by a
+  running guest, checked in as bytes.
+- `wire/testdata/mass-quote-from-rust-guest.hex` (input direction) - produced
+  by this repository's encoder. Regenerate with:
+
+  ```
+  cd rust && REGEN_WIRE_FIXTURES=1 cargo test emit_mass_quote_fixture
+  cp testdata/mass-quote-from-rust-guest.hex \
+     ../../redpanda-wasm-bench/wire/testdata/
+  ```
+
+  Without the env var the same test asserts the checked-in bytes still match
+  this encoder, so the fixture cannot go stale silently. The harness pins the
+  same bytes in *both* directions - it decodes them and asserts its own encoder
+  reproduces them - because the harness is the encoder in production and an
+  encoder bug is exactly what a decode-only test cannot see.
+
+Never hand-edit either fixture. Editing one makes the test agree with whichever
+side is wrong, which is the failure these files exist to prevent.

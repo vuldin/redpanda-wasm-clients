@@ -1,3 +1,13 @@
 /bin/
 *.wasm
 /rust/target/
+
+# Exception: the modules that published benchmark numbers were produced with.
+# bin/ is a build output and *.wasm is ignored, so until this negation existed
+# the module a published figure was measured with lived in exactly one place -
+# an untracked working copy, one `make build-wasm` away from being gone. The
+# md5 is in each filename and is what run fingerprints record, so these are
+# provenance, not build artifacts. Never regenerate one in place; add a new
+# file under its own md5 instead.
+!/rust/testdata/published-modules/
+!/rust/testdata/published-modules/*.wasm
