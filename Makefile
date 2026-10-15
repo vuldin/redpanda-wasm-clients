@@ -23,6 +23,7 @@ build-wasm:
 	cp rust/target/$(WASM_TARGET)/release/relay-sink.wasm      $(BIN)/relay-sink.wasm
 	cp rust/target/$(WASM_TARGET)/release/position-tracker.wasm $(BIN)/position-tracker.wasm
 	cp rust/target/$(WASM_TARGET)/release/mass-matcher.wasm     $(BIN)/mass-matcher.wasm
+	cp rust/target/$(WASM_TARGET)/release/book-matcher.wasm     $(BIN)/book-matcher.wasm
 	@# The freshly built single-order matcher is kept, but NOT under the name
 	@# every runner deploys. Before this, `make build-wasm` silently replaced
 	@# the published module (94c3d017) with whatever the current source
