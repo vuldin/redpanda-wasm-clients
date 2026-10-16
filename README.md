@@ -47,7 +47,7 @@ make test       # cargo test, wire format and matching logic
 | `relay-sink.wasm` | terminal consumer for fan-out load, where only the delivery matters and the output doesn't |
 | `position-tracker.wasm` | consumes fills and maintains per-participant position. An example of a stateful relay-sourced consumer |
 | `mass-matcher.wasm` | the matcher plus wire type 2 mass-quote envelopes (N orders per record). A separate module so `wasm-matcher.wasm` stays byte-identical to the published one |
-| `book-matcher.wasm` | a matcher whose book holds depth (`rust/src/fastbook.rs`: price levels in a BTreeMap, FIFO queues in a slab, an id index) and, with `STATE=snapshot`, persists itself through the broker's shared-memory state API. Must be trusted by sha256 to load; see the bench repo's `docs/RUNNING-YOUR-OWN-TESTS.md` |
+| `book-matcher.wasm` | a matcher whose book holds depth (`rust/src/fastbook.rs`: price levels in a BTreeMap, FIFO queues in a slab, an id index) and, with `STATE=snapshot`, persists itself through the broker's shared-memory state API: `SNAPSHOT_MODE=live` (default) keeps the region current slot by slot after every record and registers only the bytes in use, `full` re-serialises the whole book every `SNAPSHOT_EVERY_MS`. Must be trusted by sha256 to load; see the bench repo's `docs/RUNNING-YOUR-OWN-TESTS.md` |
 
 The guests share `rust/src/wire.rs`, and the matchers share `matcher.rs`,
 `orderbook.rs` and `risk.rs` by path. `book-matcher` is differentially tested
