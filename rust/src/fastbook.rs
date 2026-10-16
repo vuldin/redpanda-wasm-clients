@@ -75,6 +75,12 @@ pub struct Book {
     bids: BTreeMap<i64, Level>, // best = highest key
     asks: BTreeMap<i64, Level>, // best = lowest key
     index: FnvMap<String, u32>,
+    /// Slab indices whose slot changed (rested, filled down, or freed),
+    /// recorded only while `track` is on. book-matcher's live snapshot
+    /// region mirrors the slab slot for slot and rewrites exactly these
+    /// after each record, instead of re-serialising the whole book.
+    track: bool,
+    touched: Vec<u32>,
 }
 
 impl Book {
@@ -84,6 +90,34 @@ impl Book {
 
     pub fn len(&self) -> usize {
         self.index.len()
+    }
+
+    /// Slots ever allocated (live or free): the extent a slot-for-slot
+    /// mirror of the slab has to cover.
+    pub fn slab_len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The order in slab slot `idx`, or None if the slot is free.
+    pub fn slot_order(&self, idx: u32) -> Option<&Order> {
+        self.slots.get(idx as usize)?.as_ref().map(|s| &s.order)
+    }
+
+    pub fn set_tracking(&mut self, on: bool) {
+        self.track = on;
+        self.touched.clear();
+    }
+
+    /// Hand back (and forget) the slots touched since the last call.
+    pub fn take_touched(&mut self, into: &mut Vec<u32>) {
+        into.clear();
+        std::mem::swap(into, &mut self.touched);
+    }
+
+    fn touch(&mut self, idx: u32) {
+        if self.track {
+            self.touched.push(idx);
+        }
     }
 
     pub fn submit(&mut self, mut incoming: Order) -> Result<Vec<Fill>, Error> {
@@ -162,6 +196,7 @@ impl Book {
             next: NIL,
         });
         self.index.insert(id, idx);
+        self.touch(idx);
     }
 
     /// Remove a live slot from its level and the slab. The caller has
@@ -169,6 +204,7 @@ impl Book {
     fn unlink(&mut self, idx: u32) -> Order {
         let slot = self.slots[idx as usize].take().expect("indexed slot is live");
         self.free.push(idx);
+        self.touch(idx);
         if slot.prev != NIL {
             self.slots[slot.prev as usize].as_mut().unwrap().next = slot.next;
         }
@@ -228,6 +264,8 @@ impl Book {
                 let id = resting.id.clone();
                 self.index.remove(&id);
                 self.unlink(idx);
+            } else {
+                self.touch(idx);
             }
         }
         fills

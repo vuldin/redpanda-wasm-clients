@@ -8,11 +8,14 @@
 //!    1,000 resting orders per side. This guest uses ../fastbook.rs, which
 //!    is differentially tested against it below.
 //! 2. Durability. With `STATE=snapshot` the guest registers a shared-memory
-//!    region with the broker and keeps a crc-checked snapshot of its book,
-//!    risk exposure and replay high-water marks in it. The broker copies the
-//!    region into the input partition's raft group every 5s and writes it
-//!    back before the first record after a restart; the guest rebuilds from
-//!    it on that first record. `STATE=off` (the default) registers nothing,
+//!    region with the broker and keeps its book, risk exposure and replay
+//!    high-water marks in it. The broker copies the region into the input
+//!    partition's raft group every 5s and writes it back before the first
+//!    record after a restart; the guest rebuilds from it on that first record.
+//!    `SNAPSHOT_MODE=live` (the default) keeps the region current slot by slot
+//!    after every record and registers only the bytes in use; `full`
+//!    re-serialises the whole book every SNAPSHOT_EVERY_MS into a fixed-size
+//!    registration, the original format, kept for comparison. `STATE=off` (the default) registers nothing,
 //!    so the broker never checkpoints - the no-durability baseline, same
 //!    binary.
 //!
@@ -64,6 +67,10 @@ use wire::MessageType;
 pub struct Exposure {
     limit: i64,
     map: FnvMap<String, i64>,
+    /// Participants whose exposure changed, recorded only while `track` is
+    /// on (the live snapshot region rewrites their slots after each record).
+    track: bool,
+    dirty: Vec<String>,
 }
 
 impl Exposure {
@@ -71,6 +78,8 @@ impl Exposure {
         Self {
             limit,
             map: FnvMap::default(),
+            track: false,
+            dirty: Vec::new(),
         }
     }
     fn check(&self, participant: &str, notional: i64) -> bool {
@@ -81,6 +90,9 @@ impl Exposure {
         current + notional <= self.limit
     }
     fn record(&mut self, participant: &str, delta: i64) {
+        if self.track && self.dirty.last().map(|d| d.as_str()) != Some(participant) {
+            self.dirty.push(participant.to_string());
+        }
         // get_mut first: the hot path is a participant that already has
         // exposure, and entry() would allocate a String for every call.
         let v = match self.map.get_mut(participant) {
@@ -189,6 +201,9 @@ pub struct Engine {
     lanes_p: u32,
     lanes: FnvMap<LaneKey, LaneState>,
     pub stats: Stats,
+    /// The lane `classify` last changed, while tracking (live region).
+    track: bool,
+    dirty_lane: Option<LaneKey>,
 }
 
 impl Engine {
@@ -200,7 +215,20 @@ impl Engine {
             lanes_p: lanes_p.max(1),
             lanes: FnvMap::default(),
             stats: Stats::default(),
+            track: false,
+            dirty_lane: None,
         }
+    }
+
+    /// Record which slots, exposures and lanes each record changes, for the
+    /// live snapshot region. Off by default: STATE=off and the full-snapshot
+    /// mode pay nothing for it.
+    fn set_tracking(&mut self, on: bool) {
+        self.track = on;
+        self.dirty_lane = None;
+        self.book.set_tracking(on);
+        self.risk.track = on;
+        self.risk.dirty.clear();
     }
 
     /// Classify a record by its first order id. Records that do not carry a
@@ -216,6 +244,9 @@ impl Engine {
             lane: (seq % p) as u32,
         };
         let k = seq * 4 + leg as u64;
+        if self.track {
+            self.dirty_lane = Some(key.clone());
+        }
         match self.lanes.get_mut(&key) {
             None => {
                 self.lanes.insert(
@@ -646,6 +677,419 @@ pub fn restore(region: &[u8]) -> Result<(Engine, Header), RestoreError> {
 }
 
 // ---------------------------------------------------------------------------
+// live snapshot region (SNAPSHOT_MODE=live, the default for STATE=snapshot)
+// ---------------------------------------------------------------------------
+//
+// The full snapshot above re-serialises the whole book every
+// SNAPSHOT_EVERY_MS, inline with a record: 0.7ms on average at 1,000 resting
+// orders and 7.3ms (13.5ms max) at 10,000 on the 2026-10-15 cluster, which is
+// what pushed p99.9 to 10-18ms with state on. And the broker copies and
+// replicates the whole registered region - 4 MiB however small the book -
+// every 5s.
+//
+// The live region is laid out so that it never needs serialising: it mirrors
+// the book's slab slot for slot, plus fixed tables for participants and replay
+// lanes, and after each record the guest rewrites only what that record
+// changed (a few fixed-size slots). The broker reads the region between
+// invocations, so it always sees a state consistent as of the last record -
+// never older than the checkpoint that copies it, and never torn. The guest
+// re-registers the region at its USED length whenever that grows (the host
+// module replaces the registration on every call), so a checkpoint copies the
+// book's real extent rather than the allocation.
+//
+// Restore puts time priority back by resting the live orders in `sequence`
+// order: sequence is assigned on arrival and never changes, and a level's FIFO
+// is arrival order. The restored book's slab indices differ from the region's,
+// so a restore is followed by one full rewrite.
+//
+// Layout, big-endian:
+//   header (LIVE_HEADER bytes): see write_live_header
+//   lane slots   lane_cap  x LANE_SLOT : run_len u8 | phase u8 | pad[2] | lane u32 | hwm u64 | run[32]
+//   party slots  party_cap x PARTY_SLOT: len u8 | pad[7] | exposure i64 | name[24]
+//   order slots  slab_len  x ORDER_SLOT: live u8 | side u8 | id_len u8 | pad | party u32 |
+//                                         price i64 | qty i64 | sequence u64 | id[56]
+
+pub const LIVE_MAGIC: u32 = 0x424B_4D32; // "BKM2"
+pub const LIVE_VERSION: u32 = 2;
+pub const LIVE_HEADER: usize = 112;
+pub const LANE_SLOT: usize = 48;
+pub const PARTY_SLOT: usize = 40;
+pub const ORDER_SLOT: usize = 88;
+const LANE_RUN_MAX: usize = 32;
+const PARTY_NAME_MAX: usize = 24;
+const ORDER_ID_MAX: usize = 56;
+/// Re-register in steps of this much, so a growing book costs a host call
+/// every 64 KiB of growth rather than every new slot.
+const REGISTER_STEP: usize = 64 << 10;
+
+#[derive(Debug, PartialEq)]
+pub struct LiveHeader {
+    pub generation: u64,
+    pub order_count: u32,
+    pub lane_count: u32,
+    pub used_len: u32,
+    pub saved_at_ms: u64,
+}
+
+pub struct LiveRegion {
+    lane_cap: usize,
+    party_cap: usize,
+    lanes: FnvMap<LaneKey, u32>,
+    parties: FnvMap<String, u32>,
+    generation: u64,
+    /// False after an overflow: the magic is cleared so the broker
+    /// checkpoints an explicitly invalid region, and nothing is written again.
+    pub valid: bool,
+    touched: Vec<u32>,
+}
+
+fn be_u32(b: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
+}
+fn be_u64(b: &[u8], at: usize) -> u64 {
+    u64::from_be_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+impl LiveRegion {
+    pub fn new(lane_cap: usize, party_cap: usize) -> Self {
+        Self {
+            lane_cap,
+            party_cap,
+            lanes: FnvMap::default(),
+            parties: FnvMap::default(),
+            generation: 0,
+            valid: true,
+            touched: Vec::new(),
+        }
+    }
+
+    fn lanes_at(&self) -> usize {
+        LIVE_HEADER
+    }
+    fn parties_at(&self) -> usize {
+        LIVE_HEADER + self.lane_cap * LANE_SLOT
+    }
+    fn orders_at(&self) -> usize {
+        self.parties_at() + self.party_cap * PARTY_SLOT
+    }
+
+    /// Bytes in use: everything up to the last slab slot.
+    pub fn used_len(&self, e: &Engine) -> usize {
+        self.orders_at() + e.book.slab_len() * ORDER_SLOT
+    }
+
+    /// The length to register: used, rounded up to REGISTER_STEP, capped.
+    pub fn register_len(&self, e: &Engine, capacity: usize) -> usize {
+        let used = self.used_len(e);
+        used.div_ceil(REGISTER_STEP).saturating_mul(REGISTER_STEP).min(capacity)
+    }
+
+    fn invalidate(&mut self, region: &mut [u8], why: &str) {
+        if self.valid {
+            log(&format!("STATE too_big mode=live reason={why}"));
+        }
+        self.valid = false;
+        if region.len() >= 4 {
+            region[..4].copy_from_slice(&[0; 4]);
+        }
+    }
+
+    fn party_index(&mut self, region: &mut [u8], name: &str) -> Option<u32> {
+        if let Some(i) = self.parties.get(name) {
+            return Some(*i);
+        }
+        if self.parties.len() >= self.party_cap || name.len() > PARTY_NAME_MAX {
+            return None;
+        }
+        let i = self.parties.len() as u32;
+        self.parties.insert(name.to_string(), i);
+        let at = self.parties_at() + i as usize * PARTY_SLOT;
+        let slot = &mut region[at..at + PARTY_SLOT];
+        slot.fill(0);
+        slot[0] = name.len() as u8;
+        slot[16..16 + name.len()].copy_from_slice(name.as_bytes());
+        Some(i)
+    }
+
+    fn write_party(&mut self, region: &mut [u8], e: &Engine, name: &str) -> Option<()> {
+        let i = self.party_index(region, name)?;
+        let at = self.parties_at() + i as usize * PARTY_SLOT;
+        region[at + 8..at + 16].copy_from_slice(&e.risk.exposure(name).to_be_bytes());
+        Some(())
+    }
+
+    fn write_lane(&mut self, region: &mut [u8], key: &LaneKey, st: &LaneState) -> Option<()> {
+        let i = match self.lanes.get(key) {
+            Some(i) => *i,
+            None => {
+                if self.lanes.len() >= self.lane_cap || key.run.len() > LANE_RUN_MAX {
+                    return None;
+                }
+                let i = self.lanes.len() as u32;
+                self.lanes.insert(key.clone(), i);
+                i
+            }
+        };
+        let at = self.lanes_at() + i as usize * LANE_SLOT;
+        let slot = &mut region[at..at + LANE_SLOT];
+        slot.fill(0);
+        slot[0] = key.run.len() as u8;
+        slot[1] = key.phase;
+        slot[4..8].copy_from_slice(&key.lane.to_be_bytes());
+        slot[8..16].copy_from_slice(&st.hwm.to_be_bytes());
+        slot[16..16 + key.run.len()].copy_from_slice(key.run.as_bytes());
+        Some(())
+    }
+
+    fn write_order(&mut self, region: &mut [u8], e: &Engine, idx: u32) -> Option<()> {
+        let at = self.orders_at() + idx as usize * ORDER_SLOT;
+        if at + ORDER_SLOT > region.len() {
+            return None;
+        }
+        let Some(o) = e.book.slot_order(idx) else {
+            region[at] = 0; // free slot: only the live flag matters
+            return Some(());
+        };
+        if o.id.len() > ORDER_ID_MAX {
+            return None;
+        }
+        let party = self.party_index(region, &o.participant)?;
+        let slot = &mut region[at..at + ORDER_SLOT];
+        slot[0] = 1;
+        slot[1] = if o.side == Side::Buy { 0 } else { 1 };
+        slot[2] = o.id.len() as u8;
+        slot[3] = 0;
+        slot[4..8].copy_from_slice(&party.to_be_bytes());
+        slot[8..16].copy_from_slice(&o.price.to_be_bytes());
+        slot[16..24].copy_from_slice(&o.qty.to_be_bytes());
+        slot[24..32].copy_from_slice(&o.sequence.to_be_bytes());
+        slot[32..32 + o.id.len()].copy_from_slice(o.id.as_bytes());
+        Some(())
+    }
+
+    fn write_header(&mut self, region: &mut [u8], e: &Engine, now_ms: u64) {
+        self.generation += 1;
+        let h = &mut region[..LIVE_HEADER];
+        h.fill(0);
+        h[0..4].copy_from_slice(&LIVE_MAGIC.to_be_bytes());
+        h[4..8].copy_from_slice(&LIVE_VERSION.to_be_bytes());
+        h[8..16].copy_from_slice(&self.generation.to_be_bytes());
+        h[16..24].copy_from_slice(&e.seq.to_be_bytes());
+        h[24..32].copy_from_slice(&(e.risk.limit as u64).to_be_bytes());
+        h[32..36].copy_from_slice(&e.lanes_p.to_be_bytes());
+        h[36..40].copy_from_slice(&(self.lanes.len() as u32).to_be_bytes());
+        h[40..44].copy_from_slice(&(self.parties.len() as u32).to_be_bytes());
+        h[44..48].copy_from_slice(&(e.book.slab_len() as u32).to_be_bytes());
+        h[48..52].copy_from_slice(&(e.book.len() as u32).to_be_bytes());
+        h[52..56].copy_from_slice(&(self.lane_cap as u32).to_be_bytes());
+        h[56..60].copy_from_slice(&(self.party_cap as u32).to_be_bytes());
+        h[60..64].copy_from_slice(&(ORDER_SLOT as u32).to_be_bytes());
+        h[64..72].copy_from_slice(&e.stats.dup_skipped.to_be_bytes());
+        h[72..80].copy_from_slice(&e.stats.gaps.to_be_bytes());
+        h[80..88].copy_from_slice(&e.stats.gap_seqs.to_be_bytes());
+        h[88..96].copy_from_slice(&e.stats.rejected.to_be_bytes());
+        h[96..104].copy_from_slice(&now_ms.to_be_bytes());
+        let crc = crc32(&h[..104]);
+        h[104..108].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    /// Rewrite everything from the engine: on a fresh start and after a
+    /// restore. Turns tracking on.
+    pub fn sync_all(&mut self, e: &mut Engine, region: &mut [u8], now_ms: u64) {
+        e.set_tracking(true);
+        if !self.valid {
+            return;
+        }
+        if self.orders_at() > region.len() {
+            return self.invalidate(region, "tables");
+        }
+        self.lanes.clear();
+        self.parties.clear();
+        region[self.lanes_at()..self.orders_at()].fill(0);
+        let ok = (|| -> Option<()> {
+            let lanes: Vec<(LaneKey, LaneState)> =
+                e.lanes.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            for (k, v) in &lanes {
+                self.write_lane(region, k, v)?;
+            }
+            let names: Vec<String> = e.risk.map.keys().cloned().collect();
+            for n in &names {
+                self.write_party(region, e, n)?;
+            }
+            for idx in 0..e.book.slab_len() as u32 {
+                self.write_order(region, e, idx)?;
+            }
+            Some(())
+        })();
+        if ok.is_none() {
+            return self.invalidate(region, "capacity");
+        }
+        self.write_header(region, e, now_ms);
+    }
+
+    /// After one record: rewrite what it changed. Cheap - a handful of
+    /// fixed-size slots and the header.
+    pub fn sync_dirty(&mut self, e: &mut Engine, region: &mut [u8], now_ms: u64) {
+        let mut touched = std::mem::take(&mut self.touched);
+        e.book.take_touched(&mut touched);
+        let dirty_parties = std::mem::take(&mut e.risk.dirty);
+        let dirty_lane = e.dirty_lane.take();
+        if self.valid {
+            let ok = (|| -> Option<()> {
+                if let Some(k) = &dirty_lane {
+                    if let Some(st) = e.lanes.get(k).copied() {
+                        self.write_lane(region, k, &st)?;
+                    }
+                }
+                for n in &dirty_parties {
+                    self.write_party(region, e, n)?;
+                }
+                for idx in &touched {
+                    self.write_order(region, e, *idx)?;
+                }
+                Some(())
+            })();
+            match ok {
+                Some(()) => self.write_header(region, e, now_ms),
+                None => self.invalidate(region, "capacity"),
+            }
+        }
+        self.touched = touched;
+        let mut dp = dirty_parties;
+        dp.clear();
+        e.risk.dirty = dp;
+    }
+}
+
+/// Rebuild an Engine from a live region. Lanes come back with check_gap set,
+/// as with the full snapshot. The caller follows this with `sync_all`, since
+/// the restored book's slab indices are not the region's.
+pub fn restore_live(region: &[u8]) -> Result<(Engine, LiveHeader), RestoreError> {
+    if region.len() < LIVE_HEADER || region[..LIVE_HEADER].iter().all(|b| *b == 0) {
+        return Err(RestoreError::Empty);
+    }
+    if be_u32(region, 0) != LIVE_MAGIC {
+        return Err(RestoreError::BadMagic);
+    }
+    let v = be_u32(region, 4);
+    if v != LIVE_VERSION {
+        return Err(RestoreError::BadVersion(v));
+    }
+    if crc32(&region[..104]) != be_u32(region, 104) {
+        return Err(RestoreError::BadCrc);
+    }
+    let generation = be_u64(region, 8);
+    let seq = be_u64(region, 16);
+    let limit = be_u64(region, 24) as i64;
+    let lanes_p = be_u32(region, 32);
+    let n_lanes = be_u32(region, 36) as usize;
+    let n_parties = be_u32(region, 40) as usize;
+    let slab = be_u32(region, 44) as usize;
+    let order_count = be_u32(region, 48);
+    let lane_cap = be_u32(region, 52) as usize;
+    let party_cap = be_u32(region, 56) as usize;
+    let saved_at_ms = be_u64(region, 96);
+    if be_u32(region, 60) as usize != ORDER_SLOT || n_lanes > lane_cap || n_parties > party_cap {
+        return Err(RestoreError::BadPayload);
+    }
+    let orders_at = LIVE_HEADER + lane_cap * LANE_SLOT + party_cap * PARTY_SLOT;
+    let used = orders_at
+        .checked_add(slab.checked_mul(ORDER_SLOT).ok_or(RestoreError::BadPayload)?)
+        .ok_or(RestoreError::BadPayload)?;
+    if used > region.len() {
+        return Err(RestoreError::BadLength(used as u32));
+    }
+    let bad = RestoreError::BadPayload;
+    let text = |b: &[u8]| std::str::from_utf8(b).map(str::to_string).ok();
+    let mut e = Engine::new(limit, lanes_p);
+    e.seq = seq;
+    e.stats = Stats {
+        dup_skipped: be_u64(region, 64),
+        gaps: be_u64(region, 72),
+        gap_seqs: be_u64(region, 80),
+        rejected: be_u64(region, 88),
+    };
+    for i in 0..n_lanes {
+        let at = LIVE_HEADER + i * LANE_SLOT;
+        let n = region[at] as usize;
+        if n > LANE_RUN_MAX {
+            return Err(bad);
+        }
+        let run = text(&region[at + 16..at + 16 + n]).ok_or(RestoreError::BadPayload)?;
+        e.lanes.insert(
+            LaneKey {
+                run,
+                phase: region[at + 1],
+                lane: be_u32(region, at + 4),
+            },
+            LaneState {
+                hwm: be_u64(region, at + 8),
+                check_gap: true,
+            },
+        );
+    }
+    let parties_at = LIVE_HEADER + lane_cap * LANE_SLOT;
+    let mut names = Vec::with_capacity(n_parties);
+    for i in 0..n_parties {
+        let at = parties_at + i * PARTY_SLOT;
+        let n = region[at] as usize;
+        if n > PARTY_NAME_MAX {
+            return Err(bad);
+        }
+        let name = text(&region[at + 16..at + 16 + n]).ok_or(RestoreError::BadPayload)?;
+        let x = be_u64(region, at + 8) as i64;
+        if x > 0 {
+            e.risk.map.insert(name.clone(), x);
+        }
+        names.push(name);
+    }
+    let mut orders = Vec::with_capacity(order_count as usize);
+    for i in 0..slab {
+        let at = orders_at + i * ORDER_SLOT;
+        match region[at] {
+            0 => continue,
+            1 => {}
+            _ => return Err(bad),
+        }
+        let side = match region[at + 1] {
+            0 => Side::Buy,
+            1 => Side::Sell,
+            _ => return Err(bad),
+        };
+        let n = region[at + 2] as usize;
+        let party = be_u32(region, at + 4) as usize;
+        if n > ORDER_ID_MAX || party >= names.len() {
+            return Err(bad);
+        }
+        orders.push(Order {
+            id: text(&region[at + 32..at + 32 + n]).ok_or(RestoreError::BadPayload)?,
+            participant: names[party].clone(),
+            side,
+            price: be_u64(region, at + 8) as i64,
+            qty: be_u64(region, at + 16) as i64,
+            sequence: be_u64(region, at + 24),
+        });
+    }
+    if orders.len() != order_count as usize {
+        return Err(bad);
+    }
+    orders.sort_by_key(|o| o.sequence);
+    for o in orders {
+        e.book.rest(o);
+    }
+    Ok((
+        e,
+        LiveHeader {
+            generation,
+            order_count,
+            lane_count: n_lanes as u32,
+            used_len: used as u32,
+            saved_at_ms,
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // guest entrypoint
 // ---------------------------------------------------------------------------
 
@@ -653,6 +1097,29 @@ pub fn restore(region: &[u8]) -> Result<(Engine, Header), RestoreError> {
 #[link(wasm_import_module = "redpanda_wasm_shared_memory")]
 extern "C" {
     fn register_region(ptr: u32, len: u32) -> i32;
+}
+
+/// (Re-)register the first `len` bytes of `region` as the shared region.
+/// The host replaces any earlier registration, so this is how the live mode
+/// tells the broker how much of its allocation a checkpoint has to copy.
+fn register(region: &[u8], len: usize) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let rc = unsafe { register_region(region.as_ptr() as u32, len as u32) };
+        if rc != 0 {
+            panic!("register_region failed: {rc}");
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (region, len);
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SnapshotMode {
+    /// Re-serialise the whole book every SNAPSHOT_EVERY_MS (format BKM1).
+    Full,
+    /// Keep the region current slot by slot after every record (BKM2).
+    Live,
 }
 
 fn now_nanos() -> u64 {
@@ -678,6 +1145,9 @@ fn env_u64(name: &str, default: u64) -> u64 {
 struct Guest {
     engine: Engine,
     region: Option<&'static mut [u8]>,
+    mode: SnapshotMode,
+    live: LiveRegion,
+    registered: usize,
     first: bool,
     generation: u64,
     every_ns: u64,
@@ -691,10 +1161,14 @@ struct Guest {
 
 impl Guest {
     fn on_first_record(&mut self) {
-        let Some(region) = self.region.as_deref() else {
+        if self.region.is_none() {
             log("STATE off");
             return;
-        };
+        }
+        if self.mode == SnapshotMode::Live {
+            return self.on_first_record_live();
+        }
+        let Some(region) = self.region.as_deref() else { return };
         let t0 = now_nanos();
         match restore(region) {
             Ok((e, h)) => {
@@ -723,9 +1197,58 @@ impl Guest {
         }
     }
 
+    fn on_first_record_live(&mut self) {
+        let region: &mut [u8] = self.region.as_deref_mut().expect("live mode has a region");
+        let t0 = now_nanos();
+        match restore_live(region) {
+            Ok((e, h)) => {
+                let dt = now_nanos().saturating_sub(t0);
+                let age_ms = (t0 / 1_000_000).saturating_sub(h.saved_at_ms);
+                // Same field order as the full mode's line: the durability
+                // harness parses orders=, bytes= and restore_us= from it.
+                log(&format!(
+                    "STATE restored gen={} orders={} lanes={} bytes={} restore_us={} snapshot_age_ms={} seq={} mode=live",
+                    h.generation, h.order_count, h.lane_count, h.used_len, dt / 1000, age_ms, e.seq
+                ));
+                self.generation = h.generation;
+                let limit = self.engine.risk.limit;
+                let p = self.engine.lanes_p;
+                self.engine = e;
+                self.engine.risk.limit = limit;
+                self.engine.lanes_p = p;
+            }
+            Err(why) => log(&format!("STATE fresh reason={why:?} mode=live")),
+        }
+        // Restored or fresh, rewrite the whole region from the engine (the
+        // restored slab indices are not the region's), then register only
+        // what is in use.
+        let t1 = now_nanos();
+        self.live.sync_all(&mut self.engine, region, t1 / 1_000_000);
+        let n = self.live.register_len(&self.engine, region.len());
+        register(region, n);
+        self.registered = n;
+        self.last_bytes = self.live.used_len(&self.engine) as u32;
+    }
+
     fn after_record(&mut self) {
         let now = now_nanos();
-        if let Some(region) = self.region.as_deref_mut() {
+        if self.mode == SnapshotMode::Live {
+            if let Some(region) = self.region.as_deref_mut() {
+                let t0 = now_nanos();
+                self.live.sync_dirty(&mut self.engine, region, t0 / 1_000_000);
+                let n = self.live.register_len(&self.engine, region.len());
+                if n > self.registered {
+                    register(region, n);
+                    self.registered = n;
+                }
+                let dt = now_nanos().saturating_sub(t0);
+                self.save_ns_max = self.save_ns_max.max(dt);
+                self.save_ns_sum += dt;
+                self.saves += 1;
+                self.generation += 1;
+                self.last_bytes = self.live.used_len(&self.engine) as u32;
+            }
+        } else if let Some(region) = self.region.as_deref_mut() {
             if now.saturating_sub(self.last_save_ns) >= self.every_ns {
                 self.generation += 1;
                 let t0 = now_nanos();
@@ -748,7 +1271,7 @@ impl Guest {
         if now.saturating_sub(self.last_stats_ns) >= 5_000_000_000 {
             let s = self.engine.stats;
             log(&format!(
-                "STATE stats gen={} orders={} bytes={} saves={} save_us_avg={} save_us_max={} dup_skipped={} gaps={} gap_seqs={} rejected={}",
+                "STATE stats gen={} orders={} bytes={} saves={} save_us_avg={} save_us_max={} dup_skipped={} gaps={} gap_seqs={} rejected={} mode={} registered={}",
                 self.generation,
                 self.engine.book.len(),
                 self.last_bytes,
@@ -758,7 +1281,9 @@ impl Guest {
                 s.dup_skipped,
                 s.gaps,
                 s.gap_seqs,
-                s.rejected
+                s.rejected,
+                if self.mode == SnapshotMode::Live { "live" } else { "full" },
+                self.registered
             ));
             self.save_ns_max = 0;
             self.save_ns_sum = 0;
@@ -785,17 +1310,28 @@ fn main() {
         // instance - the broker holds (ptr, len) from this one call.
         let bytes = env_u64("REGION_BYTES", 4 << 20) as usize;
         let r: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
-        let rc = unsafe { register_region(r.as_ptr() as u32, r.len() as u32) };
-        if rc != 0 {
-            panic!("register_region failed: {rc}");
-        }
+        // The whole allocation, so the broker can write back a snapshot of
+        // any size before the first record; live mode then shrinks the
+        // registration to what is in use.
+        register(r, r.len());
         Some(r)
     } else {
         None
     };
+    let mode = match std::env::var("SNAPSHOT_MODE").as_deref() {
+        Ok("full") => SnapshotMode::Full,
+        _ => SnapshotMode::Live,
+    };
+    let registered = region.as_deref().map(|r| r.len()).unwrap_or(0);
     let g = RefCell::new(Guest {
         engine: Engine::new(risk_limit, lanes),
         region,
+        mode,
+        live: LiveRegion::new(
+            env_u64("LIVE_LANES", 256) as usize,
+            env_u64("LIVE_PARTIES", 1024) as usize,
+        ),
+        registered,
         first: true,
         generation: 0,
         every_ns: env_u64("SNAPSHOT_EVERY_MS", 500) * 1_000_000,
@@ -1026,6 +1562,176 @@ mod tests {
         small[..4].copy_from_slice(&MAGIC.to_be_bytes());
         assert!(save(&e, &mut small, 2, 0).is_none());
         assert_eq!(restore(&small).err(), Some(RestoreError::BadMagic));
+    }
+
+    /// Everything a restore must reproduce, in a comparable form.
+    fn dump(e: &Engine) -> (Vec<(String, String, u8, i64, i64, u64)>, Vec<(String, i64)>, Vec<(String, u8, u32, u64)>, u64, Stats) {
+        let orders = e
+            .book
+            .orders()
+            .map(|o| (o.id.clone(), o.participant.clone(), (o.side == Side::Sell) as u8, o.price, o.qty, o.sequence))
+            .collect();
+        let mut risk: Vec<_> = e.risk.map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        risk.sort();
+        let mut lanes: Vec<_> = e.lanes.iter().map(|(k, v)| (k.run.clone(), k.phase, k.lane, v.hwm)).collect();
+        lanes.sort();
+        (orders, risk, lanes, e.seq, e.stats)
+    }
+
+    /// Random traffic with loadgen-shaped ids: resting sells and buys at a
+    /// spread of prices, crossing buys, cancels and mass quotes.
+    fn random_record(rng: &mut Rng, i: u64, live_ids: &mut Vec<String>) -> Vec<u8> {
+        match rng.below(10) {
+            0..=3 => {
+                let id = format!("42t-s{i}-0");
+                live_ids.push(id.clone());
+                encode_new_order(&no(&id, 1, 100 + rng.below(50) as i64, 1 + rng.below(5) as i64))
+            }
+            4..=5 => {
+                let id = format!("42t-i{i}-0");
+                live_ids.push(id.clone());
+                encode_new_order(&no(&id, 0, 50 + rng.below(45) as i64, 1 + rng.below(3) as i64))
+            }
+            6..=7 => encode_new_order(&no(&format!("42t-b{i}-{}", 1000 + i), 0, 100 + rng.below(60) as i64, 1 + rng.below(8) as i64)),
+            8 if !live_ids.is_empty() => {
+                let k = rng.below(live_ids.len() as u64) as usize;
+                let id = live_ids.swap_remove(k);
+                encode_cancel(&Cancel { order_id: id })
+            }
+            _ => {
+                let orders = (0..3)
+                    .map(|q| {
+                        let id = format!("42t-s{i}q{q}-0");
+                        live_ids.push(id.clone());
+                        no(&id, 1, 120 + rng.below(30) as i64, 1)
+                    })
+                    .collect();
+                encode_mass_quote(&MassQuote { orders })
+            }
+        }
+    }
+
+    /// The live region tracks the engine record by record: restoring from
+    /// its bytes at any point gives an engine with the same book (including
+    /// time priority), exposure, lanes, sequence and stats - and the two then
+    /// produce byte-identical output for the same further traffic.
+    #[test]
+    fn live_region_mirrors_the_engine() {
+        let mut rng = Rng(0x5eed);
+        let mut e = Engine::new(0, 1);
+        let mut live = LiveRegion::new(64, 64);
+        let mut region = vec![0u8; 4 << 20];
+        live.sync_all(&mut e, &mut region, 0);
+        let mut ids = Vec::new();
+        for i in 0..30_000u64 {
+            let rec = random_record(&mut rng, i, &mut ids);
+            e.process(&rec);
+            live.sync_dirty(&mut e, &mut region, i);
+            assert!(live.valid);
+            if i % 7_500 == 7_499 {
+                let (mut r, h) = restore_live(&region).unwrap();
+                assert_eq!(h.order_count as usize, e.book.len());
+                assert_eq!(dump(&r), dump(&e), "state after {i} records");
+                // Same output from here on.
+                let mut ids2 = ids.clone();
+                let mut rng2 = Rng(rng.0);
+                for j in 0..200u64 {
+                    let rec = random_record(&mut rng2, 1_000_000 + i + j, &mut ids2);
+                    assert_eq!(e.process(&rec), r.process(&rec));
+                    // Keep the region in step with `e` for the next check.
+                    live.sync_dirty(&mut e, &mut region, i + j);
+                }
+                ids = ids2;
+                rng = rng2;
+            }
+        }
+        assert!(e.book.len() > 1_000, "the test should build a real book");
+    }
+
+    /// A restore re-lays the slab, so it is followed by a full rewrite; the
+    /// rewritten region restores to the same state again.
+    #[test]
+    fn live_restore_then_rewrite_round_trips() {
+        let mut rng = Rng(7);
+        let mut e = Engine::new(0, 2);
+        let mut live = LiveRegion::new(64, 64);
+        let mut region = vec![0u8; 2 << 20];
+        live.sync_all(&mut e, &mut region, 0);
+        let mut ids = Vec::new();
+        for i in 0..5_000 {
+            e.process(&random_record(&mut rng, i, &mut ids));
+            live.sync_dirty(&mut e, &mut region, i);
+        }
+        let (mut r, _) = restore_live(&region).unwrap();
+        let mut live2 = LiveRegion::new(64, 64);
+        let mut region2 = vec![0u8; 2 << 20];
+        live2.sync_all(&mut r, &mut region2, 1);
+        let (r2, _) = restore_live(&region2).unwrap();
+        assert_eq!(dump(&r2), dump(&e));
+        // The registration covers what is in use and no more than a step over.
+        let n = live2.register_len(&r, region2.len());
+        assert!(n >= live2.used_len(&r) && n - live2.used_len(&r) < REGISTER_STEP);
+    }
+
+    #[test]
+    fn live_region_rejects_corruption_and_overflow() {
+        let mut e = Engine::new(0, 1);
+        let mut live = LiveRegion::new(8, 8);
+        let mut region = vec![0u8; 64 << 10];
+        assert_eq!(restore_live(&region).err(), Some(RestoreError::Empty));
+        live.sync_all(&mut e, &mut region, 0);
+        e.process(&encode_new_order(&no("1t-s0-0", 1, 100, 1))).unwrap();
+        live.sync_dirty(&mut e, &mut region, 1);
+        assert!(restore_live(&region).is_ok());
+        let mut bad = region.clone();
+        bad[20] ^= 0xFF; // inside the crc-covered header
+        assert_eq!(restore_live(&bad).err(), Some(RestoreError::BadCrc));
+        let mut bad = region.clone();
+        let at = live.orders_at();
+        bad[at] = 7; // not a live flag
+        assert_eq!(restore_live(&bad).err(), Some(RestoreError::BadPayload));
+        // A region too small for the book is cleared, not left stale.
+        let mut small = vec![0u8; live.orders_at() + ORDER_SLOT];
+        let mut e2 = Engine::new(0, 1);
+        let mut l2 = LiveRegion::new(8, 8);
+        l2.sync_all(&mut e2, &mut small, 0);
+        for i in 0..4 {
+            e2.process(&encode_new_order(&no(&format!("1t-s{i}-0"), 1, 100 + i, 1))).unwrap();
+            l2.sync_dirty(&mut e2, &mut small, 1);
+        }
+        assert!(!l2.valid);
+        assert_eq!(small[..4], [0u8; 4], "magic cleared");
+        assert_eq!(restore_live(&small).err(), Some(RestoreError::BadMagic));
+    }
+
+    /// The point of the live mode: per-record cost stays small at depth,
+    /// where the full mode re-serialises everything. Native timing, so only
+    /// a coarse guard - the cluster run is the measurement.
+    #[test]
+    fn live_sync_cost_does_not_grow_with_depth() {
+        let mut e = Engine::new(0, 1);
+        let mut live = LiveRegion::new(64, 64);
+        let mut region = vec![0u8; 4 << 20];
+        live.sync_all(&mut e, &mut region, 0);
+        for i in 0..10_000 {
+            e.process(&encode_new_order(&no(&format!("9p-s-{i}-0"), 1, 100_000 + i, 1))).unwrap();
+            live.sync_dirty(&mut e, &mut region, 0);
+            e.process(&encode_new_order(&no(&format!("9p-b-{i}-0"), 0, 99 - (i % 98), 1))).unwrap();
+            live.sync_dirty(&mut e, &mut region, 0);
+        }
+        let t0 = std::time::Instant::now();
+        for s in 0..2_000u64 {
+            e.process(&encode_new_order(&no(&format!("7t-s{s}-0"), 1, 100, 1))).unwrap();
+            live.sync_dirty(&mut e, &mut region, s);
+            e.process(&encode_new_order(&no(&format!("7t-b{s}-123"), 0, 200, 1))).unwrap();
+            live.sync_dirty(&mut e, &mut region, s);
+        }
+        let per = t0.elapsed() / 4_000;
+        assert!(per < std::time::Duration::from_micros(200), "per-record process+sync {per:?} at depth 20k");
+        let mut full = vec![0u8; 4 << 20];
+        let t1 = std::time::Instant::now();
+        save(&e, &mut full, 1, 0).unwrap();
+        eprintln!("live: {per:?} per record at depth 20k; full snapshot: {:?} each", t1.elapsed());
     }
 
     #[test]
